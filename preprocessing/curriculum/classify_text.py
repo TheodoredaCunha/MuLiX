@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 import json
 
@@ -84,12 +85,22 @@ def generate_caption_labels(
         "alt_caption": alt_caption_classes,
     }
 
-    if save_paths:
-        if "main_caption" in save_paths:
-            with open(save_paths["main_caption"], "w", encoding="utf-8") as f:
-                json.dump(main_caption_classes, f)
-        if "alt_caption" in save_paths:
-            with open(save_paths["alt_caption"], "w", encoding="utf-8") as f:
-                json.dump(alt_caption_classes, f)
+    labels_dir = Path(__file__).resolve().parent / "labels"
+    labels_dir.mkdir(parents=True, exist_ok=True)
+
+    default_save_paths = {
+        "main_caption": str(labels_dir / "main_caption_classes.json"),
+        "alt_caption": str(labels_dir / "alt_caption_classes.json"),
+    }
+
+    if save_paths is None:
+        save_paths = default_save_paths
+    else:
+        save_paths = {**default_save_paths, **save_paths}
+
+    with open(save_paths["main_caption"], "w", encoding="utf-8") as f:
+        json.dump(main_caption_classes, f)
+    with open(save_paths["alt_caption"], "w", encoding="utf-8") as f:
+        json.dump(alt_caption_classes, f)
 
     return labels

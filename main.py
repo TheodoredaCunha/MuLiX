@@ -8,5 +8,5 @@ def info():
 if __name__ == '__main__':
     mode = sys.argv[1]
 
-    if mode == 'labels': # train model
+    if mode == 'labels':
         generate_caption_labels()
