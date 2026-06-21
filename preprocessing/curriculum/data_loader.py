@@ -3,7 +3,7 @@ from typing import Optional
 
 from datasets import load_dataset
 
-DATA_FILE_NAME = "MusicBench_train.json"
+DATA_FILE_NAME = "MusicBench_train_1k.json"
 
 
 def get_default_data_file() -> Path:
