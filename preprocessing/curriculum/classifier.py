@@ -4,7 +4,7 @@ import torch
 from typing import Dict, List, Optional
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-DEFAULT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+DEFAULT_MODEL = "Qwen/Qwen2.5-3B-Instruct"
 
 LABELS: List[str] = [
     "instrumentation and timbre",
