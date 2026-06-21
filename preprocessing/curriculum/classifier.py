@@ -18,27 +18,40 @@ LABELS: List[str] = [
 LABEL_TO_ID: Dict[str, int] = {label: idx for idx, label in enumerate(LABELS)}
 ID_TO_LABEL: Dict[int, str] = {idx: label for label, idx in LABEL_TO_ID.items()}
 
-SYSTEM_PROMPT = """You are a music annotation expert. Your task is to classify music-related sentences into semantic categories.
+SYSTEM_PROMPT = """You are a music annotation classifier.
 
-Categories:
-0 = instrumentation and timbre
-1 = tempo rhythm meter
-2 = harmony key chord progression
-3 = genre style production
-4 = emotion mood feeling
-5 = scene imagery context
+Classify the sentence into ALL applicable labels.
 
-Rules:
-- A sentence can belong to one or more categories.
-- Return ONLY a JSON array of integers (e.g., [0, 2, 4]).
-- Do not include any explanation or additional text.
-- If the sentence is empty or not music-related, return an empty array []."""
+Definitions:
 
-CLASSIFICATION_PROMPT = """Classify this music sentence into one or more categories.
+0 = Instrumentation and timbre
+ONLY if the sentence describes instruments, sound texture, tone color, recording noise, acoustic qualities, or sound effects.
 
-Sentence: "{sentence}"
+1 = Tempo rhythm beat meter
+ONLY if the sentence describes BPM, rhythm, beat count, tempo, groove, meter, time signature.
 
-Return ONLY the JSON array:"""
+2 = Key chords harmony progression
+ONLY if the sentence describes key, scale, tonality, chord names, chord progressions, harmony, harmonic structure.
+
+3 = Genre style production
+ONLY if the sentence describes genre, stylistic tradition, production style, mixing style, era.
+
+4 = Emotion mood feeling
+ONLY if the sentence describes feelings, emotional affect, mood, energy, tension.
+
+5 = Scene imagery context
+ONLY if the sentence describes situations, environments, visual scenes, places, use-cases, cinematic contexts.
+
+Important:
+- A sentence can have multiple labels.
+- Do NOT force technical descriptions into genre.
+- Do NOT confuse emotion with genre.
+- Do NOT confuse scene with instrumentation.
+- If no label fits, return [].
+
+Return ONLY JSON."""
+
+CLASSIFICATION_PROMPT = """Sentence: \"{sentence}\""""
 
 
 def get_device(device: int = 0) -> str:
