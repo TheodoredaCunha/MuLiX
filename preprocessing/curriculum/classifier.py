@@ -7,12 +7,10 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 DEFAULT_MODEL = "Qwen/Qwen2.5-3B-Instruct"
 
 LABELS: List[str] = [
-    "instrumentation and timbre",
-    "tempo rhythm beat meter",
-    "key chords harmony progression",
-    "genre style production",
-    "emotion mood feeling",
-    "scene imagery context",
+    "instrumentation timbre recording texture sound effects",
+    "tempo rhythm meter beat bpm time signature",
+    "key chords harmony progression tonality",
+    "genre style mood emotion scene context",
 ]
 
 LABEL_TO_ID: Dict[str, int] = {label: idx for idx, label in enumerate(LABELS)}
@@ -24,23 +22,17 @@ Classify the sentence into ALL applicable labels.
 
 Definitions:
 
-0 = Instrumentation and timbre
+0 = Instrumentation timbre recording texture sound effects
 ONLY if the sentence describes instruments, sound texture, tone color, recording noise, acoustic qualities, or sound effects.
 
-1 = Tempo rhythm beat meter
+1 = Tempo rhythm meter beat bpm time signature
 ONLY if the sentence describes BPM, rhythm, beat count, tempo, groove, meter, time signature.
 
-2 = Key chords harmony progression
+2 = Key chords harmony progression tonality
 ONLY if the sentence describes key, scale, tonality, chord names, chord progressions, harmony, harmonic structure.
 
-3 = Genre style production
-ONLY if the sentence describes genre, stylistic tradition, production style, mixing style, era.
-
-4 = Emotion mood feeling
-ONLY if the sentence describes feelings, emotional affect, mood, energy, tension.
-
-5 = Scene imagery context
-ONLY if the sentence describes situations, environments, visual scenes, places, use-cases, cinematic contexts.
+3 = Genre style mood emotion scene context
+ONLY if the sentence describes genre, stylistic tradition, production style, mixing style, era, mood, emotional affect, cinematic context, or scene.
 
 Important:
 - A sentence can have multiple labels.
@@ -77,32 +69,76 @@ def build_qwen_classifier(model_name: Optional[str] = None, device: int = 0):
     return {"model": model, "tokenizer": tokenizer, "device": device_str}
 
 
-def parse_model_output(output_text: str) -> List[int]:
+INSTRUMENTATION_KEYWORDS = [
+    "piano", "guitar", "drums", "bass", "violin", "synth", "flute", "vocal", "vocals",
+    "reverb", "distortion", "ambient noise", "recording", "timbre", "texture",
+]
+
+TEMPO_KEYWORDS = [
+    "bpm", "tempo", "beat", "beats per minute", "rhythm", "4/4", "3/4", "2/4", "6/8",
+    "meter", "time signature", "allegro", "andante", "presto", "moderato", "largo",
+]
+
+HARMONY_KEYWORDS = [
+    "chord", "chords", "progression", "key", "major", "minor", "maj7", "min7",
+    "dim", "aug", "sus", "tonality", "scale",
+]
+
+
+def classify_by_rules(sentence: str) -> Optional[int]:
+    """Return a rule-based label for the sentence if it matches a music keyword."""
+    if not sentence or not sentence.strip():
+        return None
+
+    normalized = sentence.lower()
+
+    for phrase in TEMPO_KEYWORDS:
+        if phrase in normalized:
+            return 1
+
+    for phrase in HARMONY_KEYWORDS:
+        if phrase in normalized:
+            return 2
+
+    for phrase in INSTRUMENTATION_KEYWORDS:
+        if phrase in normalized:
+            return 0
+
+    return None
+
+
+def parse_labels(output_text: str) -> List[int]:
     """
-    Robustly parse model output to extract label integers.
-    Handles various formats and malformed outputs.
+    Safely parse Qwen output and return a clean list of integer labels.
+
+    Rejects malformed JSON, floats, non-list outputs, duplicates, and out-of-range labels.
     """
     output_text = output_text.strip()
-    
-    # Try to extract JSON array pattern
-    json_match = re.search(r'\[[\d\s,]*\]', output_text)
-    if json_match:
-        try:
-            labels = json.loads(json_match.group())
-            # Validate: must be list of integers in range [0, len(LABELS))
-            if isinstance(labels, list) and all(isinstance(x, int) and 0 <= x < len(LABELS) for x in labels):
-                return sorted(list(set(labels)))  # Remove duplicates and sort
-        except (json.JSONDecodeError, ValueError):
-            pass
-    
-    # Fallback: extract individual digits
-    digits = re.findall(r'\b[0-5]\b', output_text)
-    if digits:
-        labels = sorted(list(set(int(d) for d in digits)))
-        return labels
-    
-    # Empty output or invalid
-    return []
+
+    match = re.search(r'\[[^\]]*\]', output_text)
+    if not match:
+        return []
+
+    try:
+        parsed = json.loads(match.group())
+    except json.JSONDecodeError:
+        return []
+
+    if not isinstance(parsed, list):
+        return []
+
+    labels: List[int] = []
+    for item in parsed:
+        if not isinstance(item, int):
+            return []
+        if item < 0 or item >= len(LABELS):
+            return []
+        labels.append(item)
+
+    return sorted(list(dict.fromkeys(labels)))
+
+
+parse_model_output = parse_labels
 
 
 def classify_sentences_batch(
@@ -164,7 +200,7 @@ def classify_sentences_batch(
                 assistant_response = response
             
             # Parse labels
-            labels = parse_model_output(assistant_response)
+            labels = parse_labels(assistant_response)
             batch_results.append(labels)
         
         results.extend(batch_results)
