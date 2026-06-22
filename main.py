@@ -1,4 +1,7 @@
-from preprocessing.curriculum.classify_text import generate_caption_labels
+from preprocessing.curriculum.classify_text import (
+    generate_caption_labels,
+    generate_reports_from_saved_labels,
+)
 
 
 def info():
@@ -9,7 +12,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["labels", "info"])
+    parser.add_argument("mode", choices=["labels", "label-reports", "info"])
     parser.add_argument("--data", default="data/MusicBench_train.json")
     parser.add_argument("--model", default="BAAI/bge-base-en-v1.5")
     parser.add_argument("--device", help="Embedding device, for example cuda or cpu")
@@ -30,6 +33,16 @@ def main():
             )
         except ImportError as exc:
             parser.exit(status=1, message=f"{exc}\n")
+    elif args.mode == 'label-reports':
+        try:
+            generate_reports_from_saved_labels(data_path=args.data)
+        except ImportError as exc:
+            parser.exit(
+                status=1,
+                message=(
+                    f"{exc}\nInstall matplotlib locally to generate the diagrams.\n"
+                ),
+            )
     else:
         info()
 
