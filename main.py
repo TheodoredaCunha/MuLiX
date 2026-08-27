@@ -2,6 +2,8 @@ from preprocessing.curriculum.classify_text import (
     generate_caption_labels,
     generate_reports_from_saved_labels,
 )
+from train import build_parser as build_train_parser
+from train import train
 
 
 def info():
@@ -10,6 +12,11 @@ def info():
 
 def main():
     import argparse
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "train":
+        train(build_train_parser().parse_args(sys.argv[2:]))
+        return
 
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=["labels", "label-reports", "info"])
