@@ -7,6 +7,7 @@ from typing import List, Optional, Sequence
 import torch
 import torchaudio
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 from language_model import FLANT5TextEncoder
 from musicmodel.contrastive import TextAudioContrastiveModel
@@ -121,9 +122,21 @@ def train(args: argparse.Namespace) -> None:
             collate_fn=collate_batch,
         )
 
+        curriculum_fraction = len(epoch_indices) / max(len(dataset), 1)
+        print(
+            f"\n=== Curriculum stage: epoch {epoch}/{args.epochs} | "
+            f"samples={len(epoch_indices)}/{len(dataset)} ({curriculum_fraction:.0%}) ==="
+        )
+
         model.train()
         total_loss = 0.0
-        for step, (audio, texts, labels) in enumerate(loader, start=1):
+        progress = tqdm(
+            enumerate(loader, start=1),
+            total=len(loader),
+            desc=f"Epoch {epoch}/{args.epochs}",
+            unit="batch",
+        )
+        for step, (audio, texts, labels) in progress:
             h_audio, z_audio = encode_audio_batch(audio_model, audio.to(device))
             outputs = model(texts, h_audio, z_audio, labels)
             optimizer.zero_grad(set_to_none=True)
@@ -132,10 +145,10 @@ def train(args: argparse.Namespace) -> None:
             total_loss += outputs["loss"].item()
 
             if step % args.log_every == 0:
-                print(f"epoch={epoch} step={step} loss={outputs['loss'].item():.4f}")
+                progress.set_postfix(loss=f"{outputs['loss'].item():.4f}")
 
         mean_loss = total_loss / max(len(loader), 1)
-        print(f"epoch={epoch} curriculum_fraction={len(epoch_indices)/len(dataset):.2f} mean_loss={mean_loss:.4f}")
+        print(f"epoch={epoch} curriculum_fraction={curriculum_fraction:.2f} mean_loss={mean_loss:.4f}")
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
