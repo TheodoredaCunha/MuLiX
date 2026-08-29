@@ -27,6 +27,23 @@ class MusicBenchDataset(Dataset):
         self.rows = rows
         self.labels = labels
         self.max_samples = int(max_seconds * 24000)
+        self.difficulties = [self._difficulty_for_labels(lbls) for lbls in self.labels]
+
+    @staticmethod
+    def _difficulty_for_labels(row_labels: Sequence[int]) -> float:
+        if not row_labels:
+            return 0.0
+        label_counts = Counter(row_labels)
+        dominant_ratio = label_counts.most_common(1)[0][1] / len(row_labels)
+        unique_labels = len(label_counts)
+        return float((1.0 - dominant_ratio) + 0.25 * (unique_labels - 1))
+
+    def curriculum_indices(self, epoch: int, total_epochs: int) -> List[int]:
+        total_epochs = max(1, total_epochs)
+        ordered_indices = sorted(range(len(self)), key=lambda idx: self.difficulties[idx])
+        curriculum_fraction = min(1.0, max(0.2, epoch / total_epochs))
+        cutoff = max(1, int(round(curriculum_fraction * len(ordered_indices))))
+        return ordered_indices[:cutoff]
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -49,11 +66,11 @@ class MusicBenchDataset(Dataset):
 
         row_labels = self.labels[index]
         curriculum_label = Counter(row_labels).most_common(1)[0][0] if row_labels else 0
-        return audio, row["main_caption"], curriculum_label
+        return audio, row["main_caption"], curriculum_label, self.difficulties[index]
 
 
 def collate_batch(batch):
-    audio, texts, labels = zip(*batch)
+    audio, texts, labels, _ = zip(*batch)
     return torch.stack(audio), list(texts), list(labels)
 
 
@@ -77,13 +94,6 @@ def encode_audio_batch(audio_model: AudioModel, audio: torch.Tensor) -> Sequence
 def train(args: argparse.Namespace) -> None:
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     dataset = MusicBenchDataset(args.data, args.labels, args.max_seconds)
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.workers,
-        collate_fn=collate_batch,
-    )
 
     audio_model = AudioModel(train_encodec=False).to(device).eval()
     text_encoder = FLANT5TextEncoder(
@@ -101,6 +111,16 @@ def train(args: argparse.Namespace) -> None:
     )
 
     for epoch in range(1, args.epochs + 1):
+        epoch_indices = dataset.curriculum_indices(epoch, args.epochs)
+        loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.workers,
+            sampler=torch.utils.data.SubsetRandomSampler(epoch_indices),
+            collate_fn=collate_batch,
+        )
+
         model.train()
         total_loss = 0.0
         for step, (audio, texts, labels) in enumerate(loader, start=1):
@@ -115,7 +135,7 @@ def train(args: argparse.Namespace) -> None:
                 print(f"epoch={epoch} step={step} loss={outputs['loss'].item():.4f}")
 
         mean_loss = total_loss / max(len(loader), 1)
-        print(f"epoch={epoch} mean_loss={mean_loss:.4f}")
+        print(f"epoch={epoch} curriculum_fraction={len(epoch_indices)/len(dataset):.2f} mean_loss={mean_loss:.4f}")
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
