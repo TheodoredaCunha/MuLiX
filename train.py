@@ -33,7 +33,10 @@ class MusicBenchDataset(Dataset):
 
     def __getitem__(self, index: int):
         row = self.rows[index]
-        audio_path = self.root / row["location"]
+        audio_name = Path(row["location"]).name
+        audio_path = self.root / "dataset" / audio_name
+        if not audio_path.exists():
+            audio_path = self.root / audio_name
         audio, sample_rate = torchaudio.load(str(audio_path))
         if sample_rate != 24000:
             audio = torchaudio.functional.resample(audio, sample_rate, 24000)
