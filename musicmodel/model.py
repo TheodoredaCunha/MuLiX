@@ -128,6 +128,13 @@ class Model(nn.Module):
 
         self.flatten_lstm()
 
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0).unsqueeze(0)
+        elif audio.dim() == 2:
+            audio = audio.unsqueeze(1)
+        elif audio.dim() != 3:
+            raise ValueError(f"Expected audio tensor to have 1, 2, or 3 dims, got shape {tuple(audio.shape)}")
+
         outputs = encodec.encode(audio)
 
         audio_codes = outputs["audio_codes"].long()
