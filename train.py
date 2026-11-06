@@ -1,8 +1,9 @@
 import argparse
 import json
+import math
 from collections import Counter
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 import torchaudio
@@ -15,7 +16,13 @@ from musicmodel.model import Model as AudioModel
 
 
 class MusicBenchDataset(Dataset):
-    def __init__(self, data_path: str, labels_path: str, max_seconds: float = 10.0):
+    def __init__(
+        self,
+        data_path: str,
+        labels_path: str,
+        max_seconds: float = 10.0,
+        audio_root: str = "dataset",
+    ):
         self.root = Path(__file__).resolve().parent
         with (self.root / data_path).open("r", encoding="utf-8") as file:
             rows = json.load(file)
@@ -23,11 +30,17 @@ class MusicBenchDataset(Dataset):
             labels = json.load(file)
 
         if len(rows) != len(labels):
-            raise ValueError("Dataset rows and curriculum labels must have the same length")
+            raise ValueError(
+                "Dataset rows and curriculum labels must have the same length "
+                f"({len(rows)} rows, {len(labels)} label entries)"
+            )
 
         self.rows = rows
         self.labels = labels
         self.max_samples = int(max_seconds * 24000)
+        self.audio_root = Path(audio_root)
+        if not self.audio_root.is_absolute():
+            self.audio_root = self.root / self.audio_root
         self.difficulties = [self._difficulty_for_labels(lbls) for lbls in self.labels]
 
     @staticmethod
@@ -40,10 +53,14 @@ class MusicBenchDataset(Dataset):
         return float((1.0 - dominant_ratio) + 0.25 * (unique_labels - 1))
 
     def curriculum_indices(self, epoch: int, total_epochs: int) -> List[int]:
-        total_epochs = max(1, total_epochs)
+        if total_epochs < 1:
+            raise ValueError("total_epochs must be at least 1")
+        if not 1 <= epoch <= total_epochs:
+            raise ValueError("epoch must be between 1 and total_epochs")
+
         ordered_indices = sorted(range(len(self)), key=lambda idx: self.difficulties[idx])
         curriculum_fraction = min(1.0, max(0.2, epoch / total_epochs))
-        cutoff = max(1, int(round(curriculum_fraction * len(ordered_indices))))
+        cutoff = min(len(ordered_indices), max(2, math.ceil(curriculum_fraction * len(ordered_indices))))
         return ordered_indices[:cutoff]
 
     def __len__(self) -> int:
@@ -52,11 +69,19 @@ class MusicBenchDataset(Dataset):
     def __getitem__(self, index: int):
         row = self.rows[index]
         location = Path(row["location"])
-        audio_name = location.name
-        audio_dir = location.parent
-        audio_path = Path("/workspace/MuLiX/dataset") / audio_dir / audio_name
-        if not audio_path.exists():
-            audio_path = Path("/workspace/MuLiX/dataset") / audio_name
+        audio_candidates = (
+            [location]
+            if location.is_absolute()
+            else [self.audio_root / location, self.audio_root / location.name]
+        )
+        audio_path = next((path for path in audio_candidates if path.is_file()), None)
+        if audio_path is None:
+            checked_paths = ", ".join(str(path) for path in audio_candidates)
+            raise FileNotFoundError(
+                f"Audio file for dataset row {index} was not found. "
+                f"Checked: {checked_paths}. Set --audio-root to the audio dataset directory."
+            )
+
         audio, sample_rate = torchaudio.load(str(audio_path))
         if sample_rate != 24000:
             audio = torchaudio.functional.resample(audio, sample_rate, 24000)
@@ -92,9 +117,40 @@ def encode_audio_batch(audio_model: AudioModel, audio: torch.Tensor) -> Sequence
     return torch.stack(h_audio), torch.stack(z_audio)
 
 
+def load_hyperparameters(config_path: str = "hyperparameters.json") -> Dict[str, Any]:
+    config_file = Path(__file__).resolve().parent / config_path
+    if not config_file.exists():
+        return {}
+
+    with config_file.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+
+    if not isinstance(data, dict):
+        raise ValueError(f"Hyperparameters config at {config_file} must contain a JSON object")
+    return data
+
+
 def train(args: argparse.Namespace) -> None:
+    if args.epochs < 1:
+        raise ValueError("epochs must be at least 1")
+    if args.batch_size < 2:
+        raise ValueError("batch_size must be at least 2 for contrastive training")
+    if args.max_seconds <= 0:
+        raise ValueError("max_seconds must be greater than 0")
+    if args.workers < 0:
+        raise ValueError("workers cannot be negative")
+    if args.log_every < 1:
+        raise ValueError("log_every must be at least 1")
+
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    dataset = MusicBenchDataset(args.data, args.labels, args.max_seconds)
+    dataset = MusicBenchDataset(
+        args.data,
+        args.labels,
+        args.max_seconds,
+        args.audio_root,
+    )
+    if len(dataset) < 2:
+        raise ValueError("At least two dataset rows are required for contrastive training")
 
     audio_model = AudioModel(train_encodec=False).to(device).eval()
     text_encoder = FLANT5TextEncoder(
@@ -113,6 +169,10 @@ def train(args: argparse.Namespace) -> None:
 
     for epoch in range(1, args.epochs + 1):
         epoch_indices = dataset.curriculum_indices(epoch, args.epochs)
+        drop_last = (
+            len(epoch_indices) > args.batch_size
+            and len(epoch_indices) % args.batch_size == 1
+        )
         loader = DataLoader(
             dataset,
             batch_size=args.batch_size,
@@ -120,6 +180,7 @@ def train(args: argparse.Namespace) -> None:
             num_workers=args.workers,
             sampler=torch.utils.data.SubsetRandomSampler(epoch_indices),
             collate_fn=collate_batch,
+            drop_last=drop_last,
         )
 
         curriculum_fraction = len(epoch_indices) / max(len(dataset), 1)
@@ -164,19 +225,21 @@ def train(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    hyperparameters = load_hyperparameters()
     parser = argparse.ArgumentParser(description="Train the MuLiX text/audio contrastive model")
-    parser.add_argument("--data", default="data/MusicBench_train.json")
-    parser.add_argument("--labels", default="data/main_caption_classes.json")
-    parser.add_argument("--text-model", default="google/flan-t5-base")
-    parser.add_argument("--device")
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--workers", type=int, default=0)
-    parser.add_argument("--max-seconds", type=float, default=10.0)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--embedding-dim", type=int, default=256)
-    parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--output", default="checkpoints/mulix_text_audio.pt")
+    parser.add_argument("--data", default=hyperparameters.get("data", "data/MusicBench_train.json"))
+    parser.add_argument("--labels", default=hyperparameters.get("labels", "data/main_caption_classes.json"))
+    parser.add_argument("--audio-root", default=hyperparameters.get("audio_root", "dataset"))
+    parser.add_argument("--text-model", default=hyperparameters.get("text_model", "google/flan-t5-base"))
+    parser.add_argument("--device", default=hyperparameters.get("device"))
+    parser.add_argument("--epochs", type=int, default=hyperparameters.get("epochs", 1))
+    parser.add_argument("--batch-size", type=int, default=hyperparameters.get("batch_size", 4))
+    parser.add_argument("--workers", type=int, default=hyperparameters.get("workers", 0))
+    parser.add_argument("--max-seconds", type=float, default=hyperparameters.get("max_seconds", 10.0))
+    parser.add_argument("--learning-rate", type=float, default=hyperparameters.get("learning_rate", 1e-4))
+    parser.add_argument("--embedding-dim", type=int, default=hyperparameters.get("embedding_dim", 256))
+    parser.add_argument("--log-every", type=int, default=hyperparameters.get("log_every", 10))
+    parser.add_argument("--output", default=hyperparameters.get("output", "checkpoints/mulix_text_audio.pt"))
     return parser
 
 

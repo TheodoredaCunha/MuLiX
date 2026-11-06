@@ -14,17 +14,15 @@ def main():
     import argparse
     import sys
 
-    if len(sys.argv) > 1 and sys.argv[1] == "train":
-        train(build_train_parser().parse_args(sys.argv[2:]))
-        return
-
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["labels", "label-reports", "info"])
+    parser.add_argument("mode", choices=["labels", "label-reports", "train", "info"])
     parser.add_argument("--data", default="data/MusicBench_train.json")
     parser.add_argument("--model", default="BAAI/bge-base-en-v1.5")
     parser.add_argument("--device", help="Embedding device, for example cuda or cpu")
     parser.add_argument("--no-reports", action="store_true")
-    args = parser.parse_args()
+    args, extra_args = parser.parse_known_args()
+    if args.mode != 'train' and extra_args:
+        parser.error(f"unrecognized arguments: {' '.join(extra_args)}")
 
     if args.mode == 'labels':
         try:
@@ -50,6 +48,9 @@ def main():
                     f"{exc}\nInstall matplotlib locally to generate the diagrams.\n"
                 ),
             )
+    elif args.mode == 'train':
+        # Train flags (e.g. --epochs, --data, --device) are parsed by the train parser.
+        train(build_train_parser().parse_args(sys.argv[2:]))
     else:
         info()
 

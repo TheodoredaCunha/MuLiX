@@ -1,0 +1,15 @@
+{
+  "data": "data/MusicBench_train.json",
+  "labels": "data/main_caption_classes.json",
+  "audio_root": "/workspace/MuLiX/dataset",
+  "text_model": "google/flan-t5-base",
+  "device": null,
+  "epochs": 50,
+  "batch_size": 32,
+  "workers": 0,
+  "max_seconds": 10.0,
+  "learning_rate": 1e-4,
+  "embedding_dim": 256,
+  "log_every": 10,
+  "output": "checkpoints/mulix_text_audio.pt"
+}
