@@ -97,6 +97,39 @@ class MusicBenchDataset(Dataset):
         return audio, row["main_caption"], curriculum_label, self.difficulties[index]
 
 
+def ensure_validation_labels(
+    data_path: str,
+    labels_path: str,
+    model_name: str,
+    device: torch.device,
+) -> str:
+    project_root = Path(__file__).resolve().parent
+    resolved_labels_path = Path(labels_path)
+    if not resolved_labels_path.is_absolute():
+        resolved_labels_path = project_root / resolved_labels_path
+    if resolved_labels_path.is_file():
+        return labels_path
+
+    from preprocessing.curriculum.classify_text import generate_caption_labels
+
+    alt_labels_path = resolved_labels_path.with_name("alt_caption_val_classes.json")
+    print(
+        f"Validation labels not found at {resolved_labels_path}; "
+        f"generating them with {model_name}."
+    )
+    generate_caption_labels(
+        data_path=data_path,
+        model_name=model_name,
+        device=str(device),
+        save_paths={
+            "main_caption": str(resolved_labels_path),
+            "alt_caption": str(alt_labels_path),
+        },
+        make_reports=False,
+    )
+    return labels_path
+
+
 def collate_batch(batch):
     audio, texts, labels, _ = zip(*batch)
     return torch.stack(audio), list(texts), list(labels)
@@ -209,6 +242,94 @@ def configure_flan_t5_freezing(
     return _apply_freeze_ratio(layer_groups, freeze_ratio), len(layer_groups)
 
 
+@torch.no_grad()
+def validate(
+    model: TextAudioContrastiveModel,
+    audio_model: AudioModel,
+    loader: DataLoader,
+    device: torch.device,
+) -> Dict[str, float]:
+    model.eval()
+    audio_model.eval()
+    total_loss = 0.0
+    total_retrieval_accuracy = 0.0
+    total_examples = 0
+    started_at = time.perf_counter()
+
+    for audio, texts, labels in tqdm(
+        loader,
+        desc="Validation",
+        unit="batch",
+        leave=False,
+    ):
+        batch_size = audio.size(0)
+        h_audio, z_audio = encode_audio_batch(audio_model, audio.to(device))
+        outputs = model(texts, h_audio, z_audio, labels)
+        batch_loss = outputs["loss"].item()
+        targets = torch.arange(batch_size, device=device)
+        audio_to_text_accuracy = (
+            outputs["logits_audio_to_text"].argmax(dim=1) == targets
+        ).float().mean().item()
+        text_to_audio_accuracy = (
+            outputs["logits_text_to_audio"].argmax(dim=1) == targets
+        ).float().mean().item()
+        retrieval_accuracy = (audio_to_text_accuracy + text_to_audio_accuracy) / 2
+
+        total_loss += batch_loss * batch_size
+        total_retrieval_accuracy += retrieval_accuracy * batch_size
+        total_examples += batch_size
+
+    duration = max(time.perf_counter() - started_at, 1e-8)
+    if total_examples == 0:
+        raise ValueError("Validation dataset produced no batches")
+    return {
+        "loss": total_loss / total_examples,
+        "retrieval_accuracy": total_retrieval_accuracy / total_examples,
+        "samples_per_second": total_examples / duration,
+    }
+
+
+def save_training_plot(metrics_path: Path, plot_path: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    with metrics_path.open("r", newline="", encoding="utf-8") as metrics_file:
+        epoch_rows = [
+            row
+            for row in csv.DictReader(metrics_file)
+            if row["event"] == "epoch"
+        ]
+    if not epoch_rows:
+        raise ValueError(f"No epoch metrics found in {metrics_path}")
+
+    epochs = [int(row["epoch"]) for row in epoch_rows]
+    train_losses = [float(row["mean_loss"]) for row in epoch_rows]
+    validation_losses = [float(row["validation_loss"]) for row in epoch_rows]
+    train_accuracies = [float(row["retrieval_accuracy"]) for row in epoch_rows]
+    validation_accuracies = [
+        float(row["validation_retrieval_accuracy"]) for row in epoch_rows
+    ]
+
+    figure, axes = plt.subplots(1, 2, figsize=(12, 5))
+    axes[0].plot(epochs, train_losses, marker="o", label="Training")
+    axes[0].plot(epochs, validation_losses, marker="o", label="Validation")
+    axes[0].set_title("Contrastive loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[0].legend()
+
+    axes[1].plot(epochs, train_accuracies, marker="o", label="Training")
+    axes[1].plot(epochs, validation_accuracies, marker="o", label="Validation")
+    axes[1].set_title("In-batch retrieval accuracy")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Accuracy")
+    axes[1].legend()
+
+    figure.tight_layout()
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(plot_path, dpi=150)
+    plt.close(figure)
+
+
 def train(args: argparse.Namespace) -> None:
     if args.epochs < 1:
         raise ValueError("epochs must be at least 1")
@@ -234,14 +355,28 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("metrics output path must be different from the model output path")
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    val_labels_path = ensure_validation_labels(
+        args.val_data,
+        args.val_labels,
+        args.label_model,
+        device,
+    )
     dataset = MusicBenchDataset(
         args.data,
         args.labels,
         args.max_seconds,
         args.audio_root,
     )
+    validation_dataset = MusicBenchDataset(
+        args.val_data,
+        val_labels_path,
+        args.max_seconds,
+        args.audio_root,
+    )
     if len(dataset) < 2:
         raise ValueError("At least two dataset rows are required for contrastive training")
+    if len(validation_dataset) < 2:
+        raise ValueError("At least two validation rows are required for contrastive validation")
 
     project_root = Path(__file__).resolve().parent
     musicconrec_weights = Path(args.musicconrec_weights)
@@ -286,6 +421,16 @@ def train(args: argparse.Namespace) -> None:
         trainable_parameters,
         lr=args.learning_rate,
     )
+    validation_batch_size = min(args.batch_size, len(validation_dataset))
+    if len(validation_dataset) % validation_batch_size == 1:
+        validation_batch_size += 1
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_size=validation_batch_size,
+        shuffle=False,
+        num_workers=args.workers,
+        collate_fn=collate_batch,
+    )
 
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
     metric_fields = (
@@ -296,9 +441,12 @@ def train(args: argparse.Namespace) -> None:
         "batch_size",
         "batch_loss",
         "mean_loss",
+        "validation_loss",
         "retrieval_accuracy",
+        "validation_retrieval_accuracy",
         "learning_rate",
         "samples_per_second",
+        "validation_samples_per_second",
         "curriculum_fraction",
     )
     with metrics_path.open("w", newline="", encoding="utf-8") as metrics_file:
@@ -389,9 +537,12 @@ def train(args: argparse.Namespace) -> None:
                         "batch_size": batch_size,
                         "batch_loss": batch_loss,
                         "mean_loss": mean_loss,
+                        "validation_loss": "",
                         "retrieval_accuracy": mean_retrieval_accuracy,
+                        "validation_retrieval_accuracy": "",
                         "learning_rate": learning_rate,
                         "samples_per_second": samples_per_second,
+                        "validation_samples_per_second": "",
                         "curriculum_fraction": curriculum_fraction,
                     }
                 )
@@ -403,10 +554,13 @@ def train(args: argparse.Namespace) -> None:
         mean_retrieval_accuracy = total_retrieval_accuracy / max(total_examples, 1)
         learning_rate = optimizer.param_groups[0]["lr"]
         samples_per_second = total_examples / max(epoch_duration, 1e-8)
+        validation_metrics = validate(model, audio_model, validation_loader, device)
         print(
             f"epoch={epoch} curriculum_fraction={curriculum_fraction:.2f} "
-            f"mean_loss={mean_loss:.4f} "
-            f"retrieval_accuracy={mean_retrieval_accuracy:.3f} "
+            f"train_loss={mean_loss:.4f} "
+            f"val_loss={validation_metrics['loss']:.4f} "
+            f"train_retrieval_accuracy={mean_retrieval_accuracy:.3f} "
+            f"val_retrieval_accuracy={validation_metrics['retrieval_accuracy']:.3f} "
             f"samples_per_sec={samples_per_second:.1f}"
         )
         write_metrics(
@@ -418,9 +572,12 @@ def train(args: argparse.Namespace) -> None:
                 "batch_size": total_examples,
                 "batch_loss": "",
                 "mean_loss": mean_loss,
+                "validation_loss": validation_metrics["loss"],
                 "retrieval_accuracy": mean_retrieval_accuracy,
+                "validation_retrieval_accuracy": validation_metrics["retrieval_accuracy"],
                 "learning_rate": learning_rate,
                 "samples_per_second": samples_per_second,
+                "validation_samples_per_second": validation_metrics["samples_per_second"],
                 "curriculum_fraction": curriculum_fraction,
             }
         )
@@ -441,6 +598,13 @@ def train(args: argparse.Namespace) -> None:
     )
     print(f"Saved checkpoint to {output_path}")
     print(f"Saved training metrics to {metrics_path}")
+    plot_path = (
+        Path(args.plot_output)
+        if args.plot_output
+        else output_path.with_suffix(".training.png")
+    )
+    save_training_plot(metrics_path, plot_path)
+    print(f"Saved training graph to {plot_path}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -448,6 +612,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the MuLiX text/audio contrastive model")
     parser.add_argument("--data", default=hyperparameters.get("data", "data/MusicBench_train.json"))
     parser.add_argument("--labels", default=hyperparameters.get("labels", "data/main_caption_classes.json"))
+    parser.add_argument(
+        "--val-data",
+        default=hyperparameters.get("val_data", "data/MusicBench_val.json"),
+    )
+    parser.add_argument(
+        "--val-labels",
+        default=hyperparameters.get(
+            "val_labels",
+            "data/main_caption_val_classes.json",
+        ),
+    )
+    parser.add_argument(
+        "--label-model",
+        default=hyperparameters.get("label_model", "BAAI/bge-base-en-v1.5"),
+        help="SentenceTransformer used to generate missing validation curriculum labels",
+    )
     parser.add_argument("--audio-root", default=hyperparameters.get("audio_root", "dataset"))
     parser.add_argument("--text-model", default=hyperparameters.get("text_model", "google/flan-t5-base"))
     parser.add_argument(
@@ -494,6 +674,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--metrics-output",
         default=hyperparameters.get("metrics_output"),
         help="CSV training log path (defaults to the model checkpoint path with .metrics.csv)",
+    )
+    parser.add_argument(
+        "--plot-output",
+        default=hyperparameters.get("plot_output"),
+        help="Training graph path (defaults to the model checkpoint path with .training.png)",
     )
     return parser
 

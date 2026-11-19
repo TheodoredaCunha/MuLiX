@@ -1,6 +1,9 @@
 {
   "data": "data/MusicBench_train.json",
   "labels": "data/main_caption_classes.json",
+  "val_data": "data/MusicBench_val.json",
+  "val_labels": "data/main_caption_val_classes.json",
+  "label_model": "BAAI/bge-base-en-v1.5",
   "audio_root": "/workspace/MuLiX/dataset",
   "text_model": "google/flan-t5-base",
   "musicconrec_weights": "musicconrec_weights/best_model.pth",
