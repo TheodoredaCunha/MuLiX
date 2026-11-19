@@ -3,3 +3,8 @@ __pycache__/
 *.py[cod]
 scripts/
 .agents/
+
+# Model checkpoints
+*.pth
+*.pt
+*.ckpt

@@ -1,9 +1,11 @@
 import argparse
+import csv
 import json
 import math
+import time
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torchaudio
@@ -100,20 +102,22 @@ def collate_batch(batch):
     return torch.stack(audio), list(texts), list(labels)
 
 
-def encode_audio_batch(audio_model: AudioModel, audio: torch.Tensor) -> Sequence[torch.Tensor]:
+def encode_audio_batch(
+    audio_model: AudioModel,
+    audio: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     h_audio = []
     z_audio = []
-    with torch.no_grad():
-        for waveform in audio:
-            encoded = audio_model._encode_audio(
-                waveform.unsqueeze(0),
-                audio_model.encodec,
-                audio_model.code_embedding,
-                audio_model.audio_pool,
-                audio_model.audio_proj,
-            )
-            z_audio.append(encoded[0].squeeze(0))
-            h_audio.append(encoded[1].squeeze(0))
+    for waveform in audio:
+        encoded = audio_model._encode_audio(
+            waveform.unsqueeze(0),
+            audio_model.encodec,
+            audio_model.code_embedding,
+            audio_model.audio_pool,
+            audio_model.audio_proj,
+        )
+        z_audio.append(encoded[0].squeeze(0))
+        h_audio.append(encoded[1].squeeze(0))
     return torch.stack(h_audio), torch.stack(z_audio)
 
 
@@ -130,6 +134,81 @@ def load_hyperparameters(config_path: str = "hyperparameters.json") -> Dict[str,
     return data
 
 
+def load_musicconrec_weights(audio_model: AudioModel, weights_path: Path) -> None:
+    if not weights_path.is_file():
+        raise FileNotFoundError(f"MusicConRec weights not found: {weights_path}")
+
+    checkpoint = torch.load(weights_path, map_location="cpu", weights_only=True)
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f"Expected a state-dict checkpoint at {weights_path}")
+
+    state_dict = checkpoint
+    for key in ("model", "state_dict", "model_state_dict"):
+        if isinstance(checkpoint.get(key), dict):
+            state_dict = checkpoint[key]
+            break
+
+    if any(not isinstance(key, str) for key in state_dict):
+        raise TypeError(f"Checkpoint keys must be strings: {weights_path}")
+    for prefix in ("module.", "model."):
+        if state_dict and all(key.startswith(prefix) for key in state_dict):
+            state_dict = {
+                key[len(prefix):]: value for key, value in state_dict.items()
+            }
+
+    audio_model.load_state_dict(state_dict, strict=True)
+
+
+def _apply_freeze_ratio(
+    layer_groups: Sequence[Sequence[torch.nn.Module]],
+    freeze_ratio: float,
+) -> int:
+    if not math.isfinite(freeze_ratio) or not 0.0 <= freeze_ratio <= 1.0:
+        raise ValueError("Freeze ratios must be between 0.0 and 1.0")
+
+    frozen_groups = math.ceil(freeze_ratio * len(layer_groups))
+    for index, group in enumerate(layer_groups):
+        for module in group:
+            for parameter in module.parameters():
+                parameter.requires_grad = index >= frozen_groups
+    return frozen_groups
+
+
+def configure_musicconrec_freezing(
+    audio_model: AudioModel,
+    freeze_ratio: float,
+) -> Tuple[int, int]:
+    for parameter in audio_model.parameters():
+        parameter.requires_grad = False
+
+    # Encodec emits discrete codes here, so only the downstream audio layers
+    # can receive gradients in this training path.
+    layer_groups = [
+        [audio_model.code_embedding],
+        [audio_model.audio_pool.attn[0]],
+        [audio_model.audio_pool.attn[2]],
+        [audio_model.audio_proj.net[0], audio_model.audio_proj.net[1]],
+        [audio_model.audio_proj.net[3]],
+    ]
+    return _apply_freeze_ratio(layer_groups, freeze_ratio), len(layer_groups)
+
+
+def configure_flan_t5_freezing(
+    text_encoder: FLANT5TextEncoder,
+    freeze_ratio: float,
+) -> Tuple[int, int]:
+    for parameter in text_encoder.parameters():
+        parameter.requires_grad = False
+
+    t5_encoder = text_encoder.encoder.encoder
+    layer_groups = (
+        [[t5_encoder.embed_tokens]]
+        + [[layer] for layer in t5_encoder.block]
+        + [[t5_encoder.final_layer_norm]]
+    )
+    return _apply_freeze_ratio(layer_groups, freeze_ratio), len(layer_groups)
+
+
 def train(args: argparse.Namespace) -> None:
     if args.epochs < 1:
         raise ValueError("epochs must be at least 1")
@@ -141,6 +220,18 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("workers cannot be negative")
     if args.log_every < 1:
         raise ValueError("log_every must be at least 1")
+    for name in ("musicconrec_freeze_ratio", "flan_t5_freeze_ratio"):
+        ratio = getattr(args, name)
+        if not math.isfinite(ratio) or not 0.0 <= ratio <= 1.0:
+            raise ValueError(f"{name.replace('_', ' ')} must be between 0.0 and 1.0")
+    output_path = Path(args.output)
+    metrics_path = (
+        Path(args.metrics_output)
+        if args.metrics_output
+        else output_path.with_suffix(".metrics.csv")
+    )
+    if metrics_path.resolve() == output_path.resolve():
+        raise ValueError("metrics output path must be different from the model output path")
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     dataset = MusicBenchDataset(
@@ -152,21 +243,72 @@ def train(args: argparse.Namespace) -> None:
     if len(dataset) < 2:
         raise ValueError("At least two dataset rows are required for contrastive training")
 
-    audio_model = AudioModel(train_encodec=False).to(device).eval()
+    project_root = Path(__file__).resolve().parent
+    musicconrec_weights = Path(args.musicconrec_weights)
+    if not musicconrec_weights.is_absolute():
+        musicconrec_weights = project_root / musicconrec_weights
+
+    audio_model = AudioModel(train_encodec=False)
+    load_musicconrec_weights(audio_model, musicconrec_weights)
+    musicconrec_frozen, musicconrec_layer_count = configure_musicconrec_freezing(
+        audio_model,
+        args.musicconrec_freeze_ratio,
+    )
+    audio_model = audio_model.to(device).eval()
+
     text_encoder = FLANT5TextEncoder(
         model_name=args.text_model,
         device=device,
-        freeze=True,
+        freeze=False,
+    )
+    flan_t5_frozen, flan_t5_layer_count = configure_flan_t5_freezing(
+        text_encoder,
+        args.flan_t5_freeze_ratio,
     )
     model = TextAudioContrastiveModel(
         text_encoder=text_encoder,
         embedding_dim=args.embedding_dim,
     ).to(device)
+    print(
+        f"MusicConRec frozen audio layers: {musicconrec_frozen}/{musicconrec_layer_count}; "
+        f"FLAN-T5 frozen layers: {flan_t5_frozen}/{flan_t5_layer_count}"
+    )
+
+    trainable_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    trainable_parameters.extend(
+        parameter
+        for parameter in audio_model.parameters()
+        if parameter.requires_grad
+    )
     optimizer = torch.optim.AdamW(
-        (parameter for parameter in model.parameters() if parameter.requires_grad),
+        trainable_parameters,
         lr=args.learning_rate,
     )
 
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metric_fields = (
+        "event",
+        "epoch",
+        "step",
+        "global_step",
+        "batch_size",
+        "batch_loss",
+        "mean_loss",
+        "retrieval_accuracy",
+        "learning_rate",
+        "samples_per_second",
+        "curriculum_fraction",
+    )
+    with metrics_path.open("w", newline="", encoding="utf-8") as metrics_file:
+        csv.DictWriter(metrics_file, fieldnames=metric_fields).writeheader()
+
+    def write_metrics(row: Dict[str, Any]) -> None:
+        with metrics_path.open("a", newline="", encoding="utf-8") as metrics_file:
+            csv.DictWriter(metrics_file, fieldnames=metric_fields).writerow(row)
+
+    global_step = 0
     for epoch in range(1, args.epochs + 1):
         epoch_indices = dataset.curriculum_indices(epoch, args.epochs)
         drop_last = (
@@ -191,6 +333,11 @@ def train(args: argparse.Namespace) -> None:
 
         model.train()
         total_loss = 0.0
+        total_retrieval_accuracy = 0.0
+        total_examples = 0
+        epoch_started = time.perf_counter()
+        last_log_time = epoch_started
+        examples_since_log = 0
         progress = tqdm(
             enumerate(loader, start=1),
             total=len(loader),
@@ -203,25 +350,97 @@ def train(args: argparse.Namespace) -> None:
             optimizer.zero_grad(set_to_none=True)
             outputs["loss"].backward()
             optimizer.step()
-            total_loss += outputs["loss"].item()
+            batch_size = audio.size(0)
+            batch_loss = outputs["loss"].item()
+            targets = torch.arange(batch_size, device=device)
+            audio_to_text_accuracy = (
+                outputs["logits_audio_to_text"].argmax(dim=1) == targets
+            ).float().mean().item()
+            text_to_audio_accuracy = (
+                outputs["logits_text_to_audio"].argmax(dim=1) == targets
+            ).float().mean().item()
+            retrieval_accuracy = (audio_to_text_accuracy + text_to_audio_accuracy) / 2
 
-            if step % args.log_every == 0:
-                progress.set_postfix(loss=f"{outputs['loss'].item():.4f}")
+            total_loss += batch_loss * batch_size
+            total_retrieval_accuracy += retrieval_accuracy * batch_size
+            total_examples += batch_size
+            examples_since_log += batch_size
+            global_step += 1
 
-        mean_loss = total_loss / max(len(loader), 1)
-        print(f"epoch={epoch} curriculum_fraction={curriculum_fraction:.2f} mean_loss={mean_loss:.4f}")
+            if step % args.log_every == 0 or step == len(loader):
+                now = time.perf_counter()
+                mean_loss = total_loss / total_examples
+                mean_retrieval_accuracy = total_retrieval_accuracy / total_examples
+                learning_rate = optimizer.param_groups[0]["lr"]
+                samples_per_second = examples_since_log / max(now - last_log_time, 1e-8)
+                progress.set_postfix(
+                    loss=f"{batch_loss:.4f}",
+                    mean_loss=f"{mean_loss:.4f}",
+                    retrieval_acc=f"{mean_retrieval_accuracy:.3f}",
+                    lr=f"{learning_rate:.2e}",
+                    samples_per_sec=f"{samples_per_second:.1f}",
+                )
+                write_metrics(
+                    {
+                        "event": "step",
+                        "epoch": epoch,
+                        "step": step,
+                        "global_step": global_step,
+                        "batch_size": batch_size,
+                        "batch_loss": batch_loss,
+                        "mean_loss": mean_loss,
+                        "retrieval_accuracy": mean_retrieval_accuracy,
+                        "learning_rate": learning_rate,
+                        "samples_per_second": samples_per_second,
+                        "curriculum_fraction": curriculum_fraction,
+                    }
+                )
+                last_log_time = now
+                examples_since_log = 0
 
-    output_path = Path(args.output)
+        epoch_duration = time.perf_counter() - epoch_started
+        mean_loss = total_loss / max(total_examples, 1)
+        mean_retrieval_accuracy = total_retrieval_accuracy / max(total_examples, 1)
+        learning_rate = optimizer.param_groups[0]["lr"]
+        samples_per_second = total_examples / max(epoch_duration, 1e-8)
+        print(
+            f"epoch={epoch} curriculum_fraction={curriculum_fraction:.2f} "
+            f"mean_loss={mean_loss:.4f} "
+            f"retrieval_accuracy={mean_retrieval_accuracy:.3f} "
+            f"samples_per_sec={samples_per_second:.1f}"
+        )
+        write_metrics(
+            {
+                "event": "epoch",
+                "epoch": epoch,
+                "step": len(loader),
+                "global_step": global_step,
+                "batch_size": total_examples,
+                "batch_loss": "",
+                "mean_loss": mean_loss,
+                "retrieval_accuracy": mean_retrieval_accuracy,
+                "learning_rate": learning_rate,
+                "samples_per_second": samples_per_second,
+                "curriculum_fraction": curriculum_fraction,
+            }
+        )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "model": model.state_dict(),
+            "musicconrec_model": audio_model.state_dict(),
             "text_model": args.text_model,
             "embedding_dim": args.embedding_dim,
+            "musicconrec_weights": str(musicconrec_weights),
+            "musicconrec_freeze_ratio": args.musicconrec_freeze_ratio,
+            "flan_t5_freeze_ratio": args.flan_t5_freeze_ratio,
+            "metrics_output": str(metrics_path),
         },
         output_path,
     )
     print(f"Saved checkpoint to {output_path}")
+    print(f"Saved training metrics to {metrics_path}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -231,6 +450,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--labels", default=hyperparameters.get("labels", "data/main_caption_classes.json"))
     parser.add_argument("--audio-root", default=hyperparameters.get("audio_root", "dataset"))
     parser.add_argument("--text-model", default=hyperparameters.get("text_model", "google/flan-t5-base"))
+    parser.add_argument(
+        "--musicconrec-weights",
+        default=hyperparameters.get(
+            "musicconrec_weights",
+            "musicconrec_weights/best_model.pth",
+        ),
+        help="MusicConRec checkpoint used to initialize the audio model",
+    )
+    parser.add_argument(
+        "--musicconrec-freeze-ratio",
+        type=float,
+        default=hyperparameters.get("musicconrec_freeze_ratio", 1.0),
+        help=(
+            "Fraction of ordered MusicConRec audio-path layers to freeze "
+            "(0=train all, 1=freeze all; Encodec remains frozen)"
+        ),
+    )
+    parser.add_argument(
+        "--flan-t5-freeze-ratio",
+        type=float,
+        default=hyperparameters.get("flan_t5_freeze_ratio", 1.0),
+        help=(
+            "Fraction of ordered FLAN-T5 layers to freeze, from embeddings through "
+            "encoder blocks (0=train all, 1=freeze all)"
+        ),
+    )
     parser.add_argument("--device", default=hyperparameters.get("device"))
     parser.add_argument("--epochs", type=int, default=hyperparameters.get("epochs", 1))
     parser.add_argument("--batch-size", type=int, default=hyperparameters.get("batch_size", 4))
@@ -238,8 +483,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-seconds", type=float, default=hyperparameters.get("max_seconds", 10.0))
     parser.add_argument("--learning-rate", type=float, default=hyperparameters.get("learning_rate", 1e-4))
     parser.add_argument("--embedding-dim", type=int, default=hyperparameters.get("embedding_dim", 256))
-    parser.add_argument("--log-every", type=int, default=hyperparameters.get("log_every", 10))
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=hyperparameters.get("log_every", 10),
+        help="Log batch metrics every N batches and always on each epoch's final batch",
+    )
     parser.add_argument("--output", default=hyperparameters.get("output", "checkpoints/mulix_text_audio.pt"))
+    parser.add_argument(
+        "--metrics-output",
+        default=hyperparameters.get("metrics_output"),
+        help="CSV training log path (defaults to the model checkpoint path with .metrics.csv)",
+    )
     return parser
 
 
