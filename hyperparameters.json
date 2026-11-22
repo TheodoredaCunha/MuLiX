@@ -11,6 +11,7 @@
   "flan_t5_freeze_ratio": 0.0,
   "device": null,
   "epochs": 50,
+  "early_stopping_patience": 5,
   "batch_size": 32,
   "workers": 0,
   "max_seconds": 10.0,

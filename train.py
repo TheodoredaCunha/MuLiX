@@ -341,6 +341,8 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("workers cannot be negative")
     if args.log_every < 1:
         raise ValueError("log_every must be at least 1")
+    if args.early_stopping_patience < 0:
+        raise ValueError("early_stopping_patience cannot be negative")
     for name in ("musicconrec_freeze_ratio", "flan_t5_freeze_ratio"):
         ratio = getattr(args, name)
         if not math.isfinite(ratio) or not 0.0 <= ratio <= 1.0:
@@ -457,6 +459,25 @@ def train(args: argparse.Namespace) -> None:
             csv.DictWriter(metrics_file, fieldnames=metric_fields).writerow(row)
 
     global_step = 0
+    best_validation_loss = math.inf
+    epochs_without_improvement = 0
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def save_checkpoint() -> None:
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "musicconrec_model": audio_model.state_dict(),
+                "text_model": args.text_model,
+                "embedding_dim": args.embedding_dim,
+                "musicconrec_weights": str(musicconrec_weights),
+                "musicconrec_freeze_ratio": args.musicconrec_freeze_ratio,
+                "flan_t5_freeze_ratio": args.flan_t5_freeze_ratio,
+                "metrics_output": str(metrics_path),
+            },
+            output_path,
+        )
+
     for epoch in range(1, args.epochs + 1):
         epoch_indices = dataset.curriculum_indices(epoch, args.epochs)
         drop_last = (
@@ -555,6 +576,8 @@ def train(args: argparse.Namespace) -> None:
         learning_rate = optimizer.param_groups[0]["lr"]
         samples_per_second = total_examples / max(epoch_duration, 1e-8)
         validation_metrics = validate(model, audio_model, validation_loader, device)
+        if not math.isfinite(validation_metrics["loss"]):
+            raise ValueError(f"Non-finite validation loss at epoch {epoch}")
         print(
             f"epoch={epoch} curriculum_fraction={curriculum_fraction:.2f} "
             f"train_loss={mean_loss:.4f} "
@@ -581,21 +604,23 @@ def train(args: argparse.Namespace) -> None:
                 "curriculum_fraction": curriculum_fraction,
             }
         )
+        if args.early_stopping_patience:
+            if validation_metrics["loss"] < best_validation_loss:
+                best_validation_loss = validation_metrics["loss"]
+                epochs_without_improvement = 0
+                save_checkpoint()
+                print(f"Saved best checkpoint at epoch {epoch} (val_loss={best_validation_loss:.4f})")
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= args.early_stopping_patience:
+                    print(
+                        f"Early stopping at epoch {epoch}: validation loss did not improve "
+                        f"for {args.early_stopping_patience} epochs."
+                    )
+                    break
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "musicconrec_model": audio_model.state_dict(),
-            "text_model": args.text_model,
-            "embedding_dim": args.embedding_dim,
-            "musicconrec_weights": str(musicconrec_weights),
-            "musicconrec_freeze_ratio": args.musicconrec_freeze_ratio,
-            "flan_t5_freeze_ratio": args.flan_t5_freeze_ratio,
-            "metrics_output": str(metrics_path),
-        },
-        output_path,
-    )
+    if not args.early_stopping_patience:
+        save_checkpoint()
     print(f"Saved checkpoint to {output_path}")
     print(f"Saved training metrics to {metrics_path}")
     plot_path = (
@@ -658,6 +683,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--device", default=hyperparameters.get("device"))
     parser.add_argument("--epochs", type=int, default=hyperparameters.get("epochs", 1))
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=hyperparameters.get("early_stopping_patience", 5),
+        help=(
+            "Stop after N epochs without a validation-loss improvement and save "
+            "the best checkpoint; 0 disables early stopping and saves the final epoch"
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=hyperparameters.get("batch_size", 4))
     parser.add_argument("--workers", type=int, default=hyperparameters.get("workers", 0))
     parser.add_argument("--max-seconds", type=float, default=hyperparameters.get("max_seconds", 10.0))
