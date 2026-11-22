@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from language_model import FLANT5TextEncoder
+from language_model import E5TextEncoder
 
 
 class TextAudioContrastiveModel(nn.Module):
@@ -15,11 +15,11 @@ class TextAudioContrastiveModel(nn.Module):
 		audio_hidden_dim: int = 128,
 		audio_projection_dim: int = 128,
 		embedding_dim: int = 256,
-		text_encoder: Optional[FLANT5TextEncoder] = None,
+		text_encoder: Optional[E5TextEncoder] = None,
 		temperature: float = 0.07,
 	):
 		super().__init__()
-		self.text_encoder = text_encoder or FLANT5TextEncoder()
+		self.text_encoder = text_encoder or E5TextEncoder()
 		self.temperature = temperature
 
 		self.audio_projection = nn.Sequential(

@@ -1,28 +1,30 @@
-from typing import Iterable, List, Optional, Sequence, Union
+from typing import List, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoTokenizer, T5EncoderModel
+from transformers import AutoModel, AutoTokenizer
 
 
 TextInput = Union[str, Sequence[str]]
 LabelInput = Optional[Sequence[Union[int, str]]]
 
 
-class FLANT5TextEncoder(nn.Module):
-	"""Encode curriculum-conditioned text with the FLAN-T5 encoder."""
+class E5TextEncoder(nn.Module):
+	"""Encode curriculum-conditioned text with a BERT-based E5 encoder."""
 
 	def __init__(
 		self,
-		model_name: str = "google/flan-t5-base",
+		model_name: str = "intfloat/e5-base-v2",
 		device: Optional[Union[str, torch.device]] = None,
 		freeze: bool = True,
 	):
 		super().__init__()
 		self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-		self.encoder = T5EncoderModel.from_pretrained(model_name)
-		self.embedding_dim = self.encoder.config.d_model
+		self.encoder = AutoModel.from_pretrained(model_name, add_pooling_layer=False)
+		if self.encoder.config.model_type != "bert":
+			raise ValueError("E5TextEncoder requires a BERT-based E5 model")
+		self.embedding_dim = self.encoder.config.hidden_size
 
 		if freeze:
 			for parameter in self.encoder.parameters():
@@ -40,10 +42,10 @@ class FLANT5TextEncoder(nn.Module):
 			raise ValueError("curriculum_labels must have one label per text")
 
 		if curriculum_labels is None:
-			return [f"music caption: {text}" for text in texts]
+			return [f"query: music caption: {text}" for text in texts]
 
 		return [
-			f"curriculum class {label}; music caption: {text}"
+			f"query: curriculum class {label}; music caption: {text}"
 			for text, label in zip(texts, curriculum_labels)
 		]
 
@@ -76,4 +78,4 @@ class FLANT5TextEncoder(nn.Module):
 		return embeddings[0] if single_text else embeddings
 
 
-LanguageModel = FLANT5TextEncoder
+LanguageModel = E5TextEncoder

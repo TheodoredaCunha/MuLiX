@@ -8,7 +8,7 @@
   "text_model": "intfloat/e5-base-v2",
   "musicconrec_weights": "musicconrec_weights/best_model.pth",
   "musicconrec_freeze_ratio": 0.0,
-  "flan_t5_freeze_ratio": 0.0,
+  "text_encoder_freeze_ratio": 0.0,
   "device": null,
   "epochs": 50,
   "early_stopping_patience": 5,

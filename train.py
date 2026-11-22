@@ -12,7 +12,7 @@ import torchaudio
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from language_model import FLANT5TextEncoder
+from language_model import E5TextEncoder
 from musicmodel.contrastive import TextAudioContrastiveModel
 from musicmodel.model import Model as AudioModel
 
@@ -226,19 +226,15 @@ def configure_musicconrec_freezing(
     return _apply_freeze_ratio(layer_groups, freeze_ratio), len(layer_groups)
 
 
-def configure_flan_t5_freezing(
-    text_encoder: FLANT5TextEncoder,
+def configure_text_encoder_freezing(
+    text_encoder: E5TextEncoder,
     freeze_ratio: float,
 ) -> Tuple[int, int]:
     for parameter in text_encoder.parameters():
         parameter.requires_grad = False
 
-    t5_encoder = text_encoder.encoder.encoder
-    layer_groups = (
-        [[t5_encoder.embed_tokens]]
-        + [[layer] for layer in t5_encoder.block]
-        + [[t5_encoder.final_layer_norm]]
-    )
+    encoder = text_encoder.encoder
+    layer_groups = [[encoder.embeddings]] + [[layer] for layer in encoder.encoder.layer]
     return _apply_freeze_ratio(layer_groups, freeze_ratio), len(layer_groups)
 
 
@@ -343,7 +339,7 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("log_every must be at least 1")
     if args.early_stopping_patience < 0:
         raise ValueError("early_stopping_patience cannot be negative")
-    for name in ("musicconrec_freeze_ratio", "flan_t5_freeze_ratio"):
+    for name in ("musicconrec_freeze_ratio", "text_encoder_freeze_ratio"):
         ratio = getattr(args, name)
         if not math.isfinite(ratio) or not 0.0 <= ratio <= 1.0:
             raise ValueError(f"{name.replace('_', ' ')} must be between 0.0 and 1.0")
@@ -393,14 +389,14 @@ def train(args: argparse.Namespace) -> None:
     )
     audio_model = audio_model.to(device).eval()
 
-    text_encoder = FLANT5TextEncoder(
+    text_encoder = E5TextEncoder(
         model_name=args.text_model,
         device=device,
         freeze=False,
     )
-    flan_t5_frozen, flan_t5_layer_count = configure_flan_t5_freezing(
+    text_frozen, text_layer_count = configure_text_encoder_freezing(
         text_encoder,
-        args.flan_t5_freeze_ratio,
+        args.text_encoder_freeze_ratio,
     )
     model = TextAudioContrastiveModel(
         text_encoder=text_encoder,
@@ -408,7 +404,7 @@ def train(args: argparse.Namespace) -> None:
     ).to(device)
     print(
         f"MusicConRec frozen audio layers: {musicconrec_frozen}/{musicconrec_layer_count}; "
-        f"FLAN-T5 frozen layers: {flan_t5_frozen}/{flan_t5_layer_count}"
+        f"E5 frozen layers: {text_frozen}/{text_layer_count}"
     )
 
     trainable_parameters = [
@@ -472,7 +468,7 @@ def train(args: argparse.Namespace) -> None:
                 "embedding_dim": args.embedding_dim,
                 "musicconrec_weights": str(musicconrec_weights),
                 "musicconrec_freeze_ratio": args.musicconrec_freeze_ratio,
-                "flan_t5_freeze_ratio": args.flan_t5_freeze_ratio,
+                "text_encoder_freeze_ratio": args.text_encoder_freeze_ratio,
                 "metrics_output": str(metrics_path),
             },
             output_path,
@@ -654,7 +650,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="SentenceTransformer used to generate missing validation curriculum labels",
     )
     parser.add_argument("--audio-root", default=hyperparameters.get("audio_root", "dataset"))
-    parser.add_argument("--text-model", default=hyperparameters.get("text_model", "google/flan-t5-base"))
+    parser.add_argument("--text-model", default=hyperparameters.get("text_model", "intfloat/e5-base-v2"))
     parser.add_argument(
         "--musicconrec-weights",
         default=hyperparameters.get(
@@ -673,12 +669,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--text-encoder-freeze-ratio",
         "--flan-t5-freeze-ratio",
+        dest="text_encoder_freeze_ratio",
         type=float,
-        default=hyperparameters.get("flan_t5_freeze_ratio", 1.0),
+        default=hyperparameters.get(
+            "text_encoder_freeze_ratio",
+            hyperparameters.get("flan_t5_freeze_ratio", 1.0),
+        ),
         help=(
-            "Fraction of ordered FLAN-T5 layers to freeze, from embeddings through "
-            "encoder blocks (0=train all, 1=freeze all)"
+            "Fraction of ordered E5 layer groups to freeze, from embeddings through "
+            "encoder blocks (0=train all, 1=freeze all); --flan-t5-freeze-ratio is a legacy alias"
         ),
     )
     parser.add_argument("--device", default=hyperparameters.get("device"))
